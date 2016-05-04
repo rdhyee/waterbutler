@@ -1,5 +1,4 @@
 import http
-import time
 import socket
 import asyncio
 import logging
@@ -10,7 +9,7 @@ from waterbutler.core import utils
 from waterbutler.server import settings
 from waterbutler.server.api.v1 import core
 from waterbutler.server.auth import AuthHandler
-from waterbutler.constants import IDENTIFIER_PATHS
+from waterbutler.core.log_payload import LogPayload
 from waterbutler.core.streams import RequestStreamReader
 from waterbutler.server.api.v1.provider.create import CreateMixin
 from waterbutler.server.api.v1.provider.metadata import MetadataMixin
@@ -118,14 +117,19 @@ class ProviderHandler(core.BaseHandler, CreateMixin, MetadataMixin, MoveCopyMixi
     def on_finish(self):
         status, method = self.get_status(), self.request.method.upper()
         # If the response code is not within the 200 range,
-        # the request was a GET, HEAD, or OPTIONS,
+        # the request was a HEAD, or OPTIONS,
         # or the response code is 202, celery will send its own callback
         # no callbacks should be sent.
-        if any((method in ('GET', 'HEAD', 'OPTIONS'), status == 202, status // 100 != 2)):
+        if any((method in ('HEAD', 'OPTIONS'), status == 202, status // 100 != 2)):
+            return
+
+        if method == 'GET' and ((self.path.is_file and 'meta' in self.request.query_arguments) or
+                                (self.path.is_dir and 'zip' not in self.request.query_arguments)):
             return
 
         # Done here just because method is defined
         action = {
+            'GET': lambda: 'download_file' if self.path.is_file else 'download_zip',
             'PUT': lambda: ('create' if self.target_path.is_file else 'create_folder') if status == 201 else 'update',
             'POST': lambda: 'move' if self.json['action'] == 'rename' else self.json['action'],
             'DELETE': lambda: 'delete'
@@ -135,55 +139,14 @@ class ProviderHandler(core.BaseHandler, CreateMixin, MetadataMixin, MoveCopyMixi
 
     @utils.async_retry(retries=5, backoff=5)
     async def _send_hook(self, action):
-        payload = {
-            'action': action,
-            'time': time.time() + 60,
-            'auth': self.auth['auth'],
-            'provider': self.provider.NAME,
-        }
+        source = LogPayload(self.resource, self.provider, path=self.path)
+        destination = None
 
-        callback_url = None
         if action in ('move', 'copy'):
-            payload.update({
-                'source': {
-                    'nid': self.resource,
-                    'kind': self.path.kind,
-                    'name': self.path.name,
-                    'path': self.path.identifier_path if self.provider.NAME in IDENTIFIER_PATHS else '/' + self.path.raw_path,
-                    'provider': self.provider.NAME,  # TODO rename to name
-                    'materialized': str(self.path),
-                    'resource': self.resource,
-                },
-                'destination': {
-                    'nid': self.dest_resource,
-                    'resource': self.dest_resource,
-                }
-            })
-            payload['destination'].update(self.dest_meta.serialized())
-            callback_url = self.dest_auth['callback_url']
-        else:
-            # This is adequate for everything but github
-            # If extra can be included it will link to the given sha
-            payload_path = self.target_path or self.path
-            payload.update({
-                'metadata': {
-                    # Hack: OSF and box use identifiers to refer to files
-                    'path': payload_path.identifier_path if self.provider.NAME in IDENTIFIER_PATHS else '/' + payload_path.raw_path,
-                    'name': payload_path.name,
-                    'materialized': str(payload_path),
-                    'provider': self.provider.NAME,
-                    'resource': self.resource,
-                }
-            })
-            callback_url = self.auth['callback_url']
-
-        resp = (await utils.send_signed_request('PUT', callback_url, payload))
-        data = await resp.read()
-
-        if resp.status != 200:
-            raise Exception(
-                'Callback was unsuccessful, got {}, {}'.format(resp, data.decode('utf-8'))
+            destination = LogPayload(
+                self.dest_resource,
+                self.dest_provider,
+                metadata=self.dest_meta,
             )
 
-        logger.info('Successfully sent callback for a {} request'.format(action))
-        logger.info('Callback succeeded with {}'.format(data.decode('utf-8')))
+        await utils.log_to_callback(action, source=source, destination=destination)
