@@ -38,6 +38,7 @@ def throttle(concurrency=10, interval=1):
 
             await event.wait()
             count += 1
+            print("@throttle [0] -->  count, last_call, concurrency, interval: {} {} {} {}".format(count, last_call, concurrency, interval))
             if count > concurrency:
                 count = 0
                 if (time.time() - last_call) < interval:
@@ -46,6 +47,8 @@ def throttle(concurrency=10, interval=1):
                     event.set()
 
             last_call = time.time()
+            _THROTTLES[asyncio.get_event_loop()] = (count, last_call, event)
+            print("@throttle [1] -->  count, last_call, concurrency, interval: {} {} {} {}".format(count, last_call, concurrency, interval))
             return await func(*args, **kwargs)
         return wrapped
     return _throttle
